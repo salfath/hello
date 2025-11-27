@@ -1,0 +1,79 @@
+name: deploy-ssh
+
+on:
+  workflow_dispatch:      # Bisa dijalankan manual
+  release:
+    types: [published]    # Jalan otomatis saat Release baru dibuat
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Download artifact (zip) dari Release GitHub
+      - name: Download app.zip from latest release
+        uses: robinraju/release-downloader@v1.11
+        with:
+          repository: ${{ github.repository }}
+          latest: true
+          fileName: "app.zip"
+
+      # 2. Daftarkan Host Key Server (mencegah Man-in-the-Middle)
+      - name: Add server host key (pin)
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+
+      # 3. Copy file zip ke server
+      - name: Copy app.zip to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "app.zip"
+          target: "/srv/hello/"
+
+      # 4. Eksekusi Deployment via SSH
+      - name: Deploy via SSH (atomic release + systemd)
+        uses: appleboy/ssh-action@v1.1.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            set -euo pipefail
+            cd /srv/hello
+            
+            # Buat folder release unik berdasarkan waktu
+            ts="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+            mkdir -p "releases/$ts"
+            
+            # Unzip aplikasi
+            unzip -o app.zip -d "releases/$ts"
+            
+            # Install dependencies (production only)
+            cd "releases/$ts"
+            if [ -f "package-lock.json" ]; then
+              npm ci --omit=dev
+            else
+              npm install --omit=dev
+            fi
+            
+            # Update symlink 'current' ke versi terbaru (Atomic Switch)
+            ln -sfn "/srv/hello/releases/$ts" /srv/hello/current
+            
+            # Restart service
+            sudo systemctl restart hello
+            
+            # Health Check (Tunggu 5 detik agar service boot up)
+            sleep 5
+            curl -fsS http://localhost:3000/health || (sudo journalctl -u hello -n 50 --no-pager; exit 1)
+            
+            # Bersihkan rilis lama (sisakan 5 terbaru)
+            ls -1dt /srv/hello/releases/* | tail -n +6 | xargs -r rm -rf
